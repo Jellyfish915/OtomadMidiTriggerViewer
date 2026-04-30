@@ -62,6 +62,12 @@ export type LoopSettings = {
   endBeat: number;
 };
 
+export type ExportSettings = {
+  fps: number;
+  startBeat: number;
+  endBeat: number;
+};
+
 export type MoveEffectParams = {
   startX: number;
   startY: number;
@@ -141,6 +147,7 @@ export type AppSettings = {
   media: MediaSettings;
   mask: MaskSettings;
   loop: LoopSettings;
+  export: ExportSettings;
   tracks: Record<string, boolean>;
   animations: Record<EffectPhase, AnimationEffect[]>;
 };

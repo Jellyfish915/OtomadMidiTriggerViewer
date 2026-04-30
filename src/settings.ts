@@ -37,6 +37,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
     startBeat: 0,
     endBeat: 16
   },
+  export: {
+    fps: 30,
+    startBeat: 0,
+    endBeat: 16
+  },
   tracks: {},
   animations: {
     enter: [
@@ -185,6 +190,12 @@ export function normalizeSettings(settings: AppSettings): AppSettings {
     settings.loop.startBeat + 0.25,
     clampNumber(settings.loop.endBeat, 0.25, 99999, 16)
   );
+  settings.export.fps = clampNumber(settings.export.fps, 1, 120, 30);
+  settings.export.startBeat = clampNumber(settings.export.startBeat, 0, 99999, 0);
+  settings.export.endBeat = Math.max(
+    settings.export.startBeat + 0.25,
+    clampNumber(settings.export.endBeat, 0.25, 99999, 16)
+  );
 
   for (const phase of ["enter", "exit"] as EffectPhase[]) {
     settings.animations[phase] = settings.animations[phase].map((effect) => ({
@@ -216,6 +227,10 @@ function mergeSettings(base: AppSettings, stored: unknown): AppSettings {
     loop: {
       ...base.loop,
       ...(isRecord(stored.loop) ? stored.loop : {})
+    },
+    export: {
+      ...base.export,
+      ...(isRecord(stored.export) ? stored.export : {})
     },
     tracks: isRecord(stored.tracks) ? (stored.tracks as Record<string, boolean>) : {},
     animations: {

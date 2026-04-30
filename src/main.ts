@@ -38,6 +38,11 @@ type DomRefs = {
   loopRange: HTMLElement;
   loopStartInput: HTMLInputElement;
   loopEndInput: HTMLInputElement;
+  exportFpsInput: HTMLInputElement;
+  exportStartInput: HTMLInputElement;
+  exportEndInput: HTMLInputElement;
+  exportButton: HTMLButtonElement;
+  exportStatus: HTMLElement;
   mediaName: HTMLElement;
   midiName: HTMLElement;
   triggerStatus: HTMLElement;
@@ -73,6 +78,7 @@ type AppState = {
   triggers: MidiTrigger[];
   media: MediaAsset | null;
   isPlaying: boolean;
+  isExporting: boolean;
   playbackStartedAt: number;
   pausedElapsedSec: number;
   forceRenderReset: boolean;
@@ -103,6 +109,7 @@ async function bootstrap(root: HTMLElement): Promise<void> {
     triggers: [],
     media: null,
     isPlaying: false,
+    isExporting: false,
     playbackStartedAt: performance.now(),
     pausedElapsedSec: 0,
     forceRenderReset: true,
@@ -195,6 +202,28 @@ function createShellHtml(): string {
               <span>B終了拍</span>
               <input data-input="loop-end" type="number" min="0.25" step="0.25" />
             </label>
+          </div>
+        </section>
+
+        <section class="panel-section">
+          <h2>動画書き出し</h2>
+          <div class="control-grid three">
+            <label class="control">
+              <span>FPS</span>
+              <input data-input="export-fps" type="number" min="1" max="120" step="1" />
+            </label>
+            <label class="control">
+              <span>開始拍</span>
+              <input data-input="export-start" type="number" min="0" step="0.25" />
+            </label>
+            <label class="control">
+              <span>終了拍</span>
+              <input data-input="export-end" type="number" min="0.25" step="0.25" />
+            </label>
+          </div>
+          <div class="button-row export-row">
+            <button class="primary-button" data-action="export-video" type="button">WebMを書き出し</button>
+            <strong class="export-status" data-status="export">待機中</strong>
           </div>
         </section>
 
@@ -309,6 +338,11 @@ function collectRefs(root: HTMLElement): DomRefs {
     loopRange: mustQuery(root, "[data-loop-range]"),
     loopStartInput: mustQuery(root, '[data-input="loop-start"]'),
     loopEndInput: mustQuery(root, '[data-input="loop-end"]'),
+    exportFpsInput: mustQuery(root, '[data-input="export-fps"]'),
+    exportStartInput: mustQuery(root, '[data-input="export-start"]'),
+    exportEndInput: mustQuery(root, '[data-input="export-end"]'),
+    exportButton: mustQuery(root, '[data-action="export-video"]'),
+    exportStatus: mustQuery(root, '[data-status="export"]'),
     mediaName: mustQuery(root, '[data-status="media-name"]'),
     midiName: mustQuery(root, '[data-status="midi-name"]'),
     triggerStatus: mustQuery(root, '[data-status="triggers"]'),
@@ -407,6 +441,45 @@ function bindControls(state: AppState): void {
     refs.loopEndInput.value = String(state.settings.loop.endBeat);
     state.forceRenderReset = true;
     persist(state);
+  });
+
+  bindNumericInput(refs.exportFpsInput, () => {
+    state.settings.export.fps = parseClampedNumber(
+      refs.exportFpsInput.value,
+      1,
+      120,
+      30
+    );
+    refs.exportFpsInput.value = String(state.settings.export.fps);
+    persist(state);
+  });
+
+  bindNumericInput(refs.exportStartInput, () => {
+    state.settings.export.startBeat = parseClampedNumber(
+      refs.exportStartInput.value,
+      0,
+      99999,
+      0
+    );
+    refs.exportStartInput.value = String(state.settings.export.startBeat);
+    if (state.settings.export.endBeat <= state.settings.export.startBeat) {
+      state.settings.export.endBeat = state.settings.export.startBeat + 0.25;
+      refs.exportEndInput.value = String(state.settings.export.endBeat);
+    }
+    persist(state);
+  });
+
+  bindNumericInput(refs.exportEndInput, () => {
+    state.settings.export.endBeat = Math.max(
+      state.settings.export.startBeat + 0.25,
+      parseClampedNumber(refs.exportEndInput.value, 0.25, 99999, 16)
+    );
+    refs.exportEndInput.value = String(state.settings.export.endBeat);
+    persist(state);
+  });
+
+  refs.exportButton.addEventListener("click", () => {
+    void exportVideo(state);
   });
 
   refs.patternButtons.forEach((button) => {
@@ -557,6 +630,11 @@ function bindControls(state: AppState): void {
 
 function loop(state: AppState): void {
   const tick = (): void => {
+    if (state.isExporting) {
+      state.rafId = window.requestAnimationFrame(tick);
+      return;
+    }
+
     const playback = getPlaybackState(state);
     const durationBeats = getProjectDurationBeats(state);
     const looped = applyLoop(
@@ -701,6 +779,191 @@ function disposeMedia(state: AppState): void {
   state.media.texture.destroy(true);
   URL.revokeObjectURL(state.media.url);
   state.media = null;
+}
+
+async function exportVideo(state: AppState): Promise<void> {
+  if (state.isExporting) {
+    return;
+  }
+
+  if (!state.media) {
+    state.refs.exportStatus.textContent = "素材を読み込んでください";
+    return;
+  }
+
+  const sourceCanvas = state.renderer.getCanvas();
+  const exportCanvas = document.createElement("canvas");
+  if (typeof exportCanvas.captureStream !== "function") {
+    state.refs.exportStatus.textContent = "このブラウザは書き出し非対応です";
+    return;
+  }
+
+  if (typeof MediaRecorder === "undefined") {
+    state.refs.exportStatus.textContent = "MediaRecorder非対応です";
+    return;
+  }
+
+  const mimeType = getSupportedVideoMimeType();
+  if (!mimeType) {
+    state.refs.exportStatus.textContent = "WebM書き出し非対応です";
+    return;
+  }
+
+  const fps = Math.max(1, Math.min(120, state.settings.export.fps));
+  const startBeat = Math.max(0, state.settings.export.startBeat);
+  const endBeat = Math.max(startBeat + 0.25, state.settings.export.endBeat);
+  const startSec = beatsToSeconds(startBeat, state.settings.bpm);
+  const endSec = beatsToSeconds(endBeat, state.settings.bpm);
+  const durationSec = Math.max(1 / fps, endSec - startSec);
+  const previousElapsedSec = getPlaybackState(state).elapsedSec;
+
+  state.isExporting = true;
+  state.isPlaying = false;
+  state.refs.exportButton.disabled = true;
+  state.refs.exportStatus.textContent = "準備中";
+  syncTransport(state);
+
+  state.renderer.render({
+    settings: state.settings,
+    triggers: state.triggers,
+    timeSec: startSec,
+    isPlaying: false,
+    forceReset: true
+  });
+  const cropRect = state.renderer.getMaskRect();
+  exportCanvas.width = Math.max(1, Math.round(cropRect.width));
+  exportCanvas.height = Math.max(1, Math.round(cropRect.height));
+  const exportContext = exportCanvas.getContext("2d");
+  if (!exportContext) {
+    state.refs.exportStatus.textContent = "書き出し用canvasを作成できませんでした";
+    state.isExporting = false;
+    state.refs.exportButton.disabled = false;
+    syncTransport(state);
+    return;
+  }
+  copyPreviewCrop(
+    sourceCanvas,
+    cropRect,
+    exportCanvas,
+    exportContext,
+    state.settings.mask.backgroundColor
+  );
+
+  const stream = exportCanvas.captureStream(fps);
+  const track = stream.getVideoTracks()[0];
+  const requestFrame =
+    track && "requestFrame" in track
+      ? (): void => {
+          (track as CanvasCaptureMediaStreamTrack).requestFrame();
+        }
+      : (): void => {};
+  const recorder = new MediaRecorder(stream, {
+    mimeType,
+    videoBitsPerSecond: 12_000_000
+  });
+  const chunks: BlobPart[] = [];
+  const stopped = new Promise<Blob>((resolve, reject) => {
+    recorder.addEventListener("dataavailable", (event) => {
+      if (event.data.size > 0) {
+        chunks.push(event.data);
+      }
+    });
+    recorder.addEventListener("error", () => {
+      reject(new Error("動画の書き出しに失敗しました。"));
+    });
+    recorder.addEventListener("stop", () => {
+      resolve(new Blob(chunks, { type: mimeType }));
+    });
+  });
+
+  try {
+    state.renderer.render({
+      settings: state.settings,
+      triggers: state.triggers,
+      timeSec: startSec,
+      isPlaying: false,
+      forceReset: true
+    });
+    copyPreviewCrop(
+      sourceCanvas,
+      cropRect,
+      exportCanvas,
+      exportContext,
+      state.settings.mask.backgroundColor
+    );
+    requestFrame();
+    await delay(120);
+
+    recorder.start(250);
+    const totalFrames = Math.max(1, Math.ceil(durationSec * fps));
+    const startedAt = performance.now();
+
+    for (let frame = 0; frame <= totalFrames; frame += 1) {
+      const targetTime = startedAt + (frame / fps) * 1000;
+      const waitMs = targetTime - performance.now();
+      if (waitMs > 0) {
+        await delay(waitMs);
+      }
+
+      const elapsedSec = Math.min(durationSec, frame / fps);
+      const timeSec = startSec + elapsedSec;
+      state.renderer.render({
+        settings: state.settings,
+        triggers: state.triggers,
+        timeSec,
+        isPlaying: frame < totalFrames,
+        forceReset: frame === 0
+      });
+      copyPreviewCrop(
+        sourceCanvas,
+        cropRect,
+        exportCanvas,
+        exportContext,
+        state.settings.mask.backgroundColor
+      );
+      requestFrame();
+      syncRuntimeStatus(state, timeSec, secondsToBeats(timeSec, state.settings.bpm));
+      state.refs.exportStatus.textContent = `書き出し中 ${Math.round(
+        (elapsedSec / durationSec) * 100
+      )}%`;
+    }
+
+    await delay(120);
+    recorder.stop();
+    const blob = await stopped;
+    if (blob.size <= 0) {
+      throw new Error("書き出しデータが空です。");
+    }
+
+    downloadBlob(blob, createExportFileName());
+    state.refs.exportStatus.textContent = "書き出し完了";
+  } catch (error) {
+    if (recorder.state !== "inactive") {
+      recorder.stop();
+    }
+    state.refs.exportStatus.textContent =
+      error instanceof Error ? error.message : "書き出しに失敗しました";
+  } finally {
+    stream.getTracks().forEach((streamTrack) => streamTrack.stop());
+    state.pausedElapsedSec = previousElapsedSec;
+    state.isPlaying = false;
+    state.isExporting = false;
+    state.refs.exportButton.disabled = false;
+    state.renderer.render({
+      settings: state.settings,
+      triggers: state.triggers,
+      timeSec: previousElapsedSec,
+      isPlaying: false,
+      forceReset: true
+    });
+    syncRuntimeStatus(
+      state,
+      previousElapsedSec,
+      secondsToBeats(previousElapsedSec, state.settings.bpm)
+    );
+    syncTransport(state);
+    state.forceRenderReset = false;
+  }
 }
 
 function rebuildTriggers(state: AppState): void {
@@ -939,6 +1202,9 @@ function syncAllControls(state: AppState): void {
   refs.bpmInput.value = String(settings.bpm);
   refs.loopStartInput.value = String(settings.loop.startBeat);
   refs.loopEndInput.value = String(settings.loop.endBeat);
+  refs.exportFpsInput.value = String(settings.export.fps);
+  refs.exportStartInput.value = String(settings.export.startBeat);
+  refs.exportEndInput.value = String(settings.export.endBeat);
   refs.fpsInput.value = String(settings.media.fps);
   refs.startFrameInput.value = String(settings.media.startFrame);
   refs.endFrameInput.value = String(settings.media.endFrame);
@@ -1106,6 +1372,71 @@ function parseClampedNumber(
   }
 
   return Math.min(max, Math.max(min, parsed));
+}
+
+function copyPreviewCrop(
+  sourceCanvas: HTMLCanvasElement,
+  cropRect: MaskRect,
+  exportCanvas: HTMLCanvasElement,
+  context: CanvasRenderingContext2D,
+  backgroundColor: string
+): void {
+  const sourceScaleX = sourceCanvas.width / Math.max(1, cropRect.stageWidth);
+  const sourceScaleY = sourceCanvas.height / Math.max(1, cropRect.stageHeight);
+  const sourceX = cropRect.x * sourceScaleX;
+  const sourceY = cropRect.y * sourceScaleY;
+  const sourceWidth = cropRect.width * sourceScaleX;
+  const sourceHeight = cropRect.height * sourceScaleY;
+
+  context.clearRect(0, 0, exportCanvas.width, exportCanvas.height);
+  context.fillStyle = backgroundColor;
+  context.fillRect(0, 0, exportCanvas.width, exportCanvas.height);
+  context.drawImage(
+    sourceCanvas,
+    sourceX,
+    sourceY,
+    sourceWidth,
+    sourceHeight,
+    0,
+    0,
+    exportCanvas.width,
+    exportCanvas.height
+  );
+}
+
+function getSupportedVideoMimeType(): string | null {
+  const candidates = [
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm"
+  ];
+
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type)) ?? null;
+}
+
+function downloadBlob(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function createExportFileName(): string {
+  const stamp = new Date()
+    .toISOString()
+    .replace(/[:.]/g, "-")
+    .replace("T", "_")
+    .replace("Z", "");
+
+  return `otomad-export_${stamp}.webm`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, Math.max(0, ms)));
 }
 
 function waitForEvent(target: EventTarget, eventName: string): Promise<void> {

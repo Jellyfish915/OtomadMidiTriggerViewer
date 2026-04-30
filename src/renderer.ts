@@ -54,7 +54,7 @@ const MASK_MARGIN = 32;
 const TILE_RADIUS = 4;
 const BLUR_EPSILON = 0.05;
 const MAX_REALTIME_PLAYBACK_RATE = 4;
-const MIN_REALTIME_PLAYBACK_RATE = 0.05;
+const MIN_REALTIME_PLAYBACK_RATE = 0.25;
 
 export class PixiPreviewRenderer {
   private app: Application | null = null;
@@ -107,6 +107,14 @@ export class PixiPreviewRenderer {
     this.clearInstances();
     this.media = media;
     this.lastTimeSec = null;
+  }
+
+  getCanvas(): HTMLCanvasElement {
+    return this.requireApp().canvas as HTMLCanvasElement;
+  }
+
+  getMaskRect(): MaskRect {
+    return { ...this.maskRect };
   }
 
   render(input: RenderInput): void {
@@ -379,7 +387,13 @@ export class PixiPreviewRenderer {
       return;
     }
 
-    video.playbackRate = clampedPlaybackRate;
+    if (!setVideoPlaybackRate(video, clampedPlaybackRate)) {
+      pauseVideo(media);
+      requestVideoFrame(media, desiredTime);
+      drawCurrentVideoFrame(media);
+      return;
+    }
+
     playVideo(media);
     drawCurrentVideoFrame(media);
   }
@@ -521,8 +535,11 @@ async function seekAndDrawVideoFrame(
     await seekVideoElement(media.video, timeSec);
     drawCurrentVideoFrame(media, true);
     if (media.playAfterSeek && media.video.readyState >= 2) {
-      media.video.playbackRate = media.requestedPlaybackRate ?? 1;
-      playVideo(media);
+      if (setVideoPlaybackRate(media.video, media.requestedPlaybackRate ?? 1)) {
+        playVideo(media);
+      } else {
+        media.playAfterSeek = false;
+      }
     }
   } finally {
     media.videoSeekPending = false;
@@ -583,6 +600,18 @@ function playVideo(media: MediaAsset): void {
     // Muted object-URL videos usually play without a gesture. If the browser
     // still blocks playback, the next render tick will keep the last frame.
   });
+}
+
+function setVideoPlaybackRate(video: HTMLVideoElement, playbackRate: number): boolean {
+  try {
+    video.playbackRate = Math.min(
+      MAX_REALTIME_PLAYBACK_RATE,
+      Math.max(MIN_REALTIME_PLAYBACK_RATE, playbackRate)
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function pauseVideo(media: MediaAsset | null): void {

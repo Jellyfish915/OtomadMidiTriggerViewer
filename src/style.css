@@ -269,6 +269,19 @@ button {
   gap: 0.65rem;
 }
 
+.export-row {
+  align-items: center;
+}
+
+.export-status {
+  min-width: 0;
+  color: #343733;
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .primary-button,
 .plain-button,
 .segmented button {
