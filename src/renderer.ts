@@ -55,6 +55,8 @@ const TILE_RADIUS = 4;
 const BLUR_EPSILON = 0.05;
 const MAX_REALTIME_PLAYBACK_RATE = 4;
 const MIN_REALTIME_PLAYBACK_RATE = 0.25;
+const VIDEO_TIME_EPSILON_SEC = 0.005;
+const VIDEO_SEEK_TIMEOUT_MS = 1500;
 
 export class PixiPreviewRenderer {
   private app: Application | null = null;
@@ -365,9 +367,13 @@ export class PixiPreviewRenderer {
     const driftSec = Math.abs(video.currentTime - desiredTime);
 
     if (media.videoSeekPending) {
-      if (!canPlayRealtime) {
-        media.playAfterSeek = false;
+      const activeSeekTime =
+        media.requestedVideoTime ?? media.lastDrawnVideoTime ?? video.currentTime;
+      if (Math.abs(desiredTime - activeSeekTime) > VIDEO_TIME_EPSILON_SEC) {
+        media.queuedVideoTime = desiredTime;
       }
+      media.playAfterSeek = canPlayRealtime;
+      media.requestedPlaybackRate = clampedPlaybackRate;
       drawCurrentVideoFrame(media);
       return;
     }
@@ -375,8 +381,9 @@ export class PixiPreviewRenderer {
     if (!canPlayRealtime || driftSec > seekToleranceSec) {
       pauseVideo(media);
       if (
-        driftSec > 0.005 &&
-        Math.abs((media.requestedVideoTime ?? -1) - desiredTime) > 0.005
+        driftSec > VIDEO_TIME_EPSILON_SEC &&
+        Math.abs((media.requestedVideoTime ?? -1) - desiredTime) >
+          VIDEO_TIME_EPSILON_SEC
       ) {
         requestVideoFrame(media, desiredTime, {
           playAfterSeek: canPlayRealtime,
@@ -534,13 +541,18 @@ async function seekAndDrawVideoFrame(
   try {
     await seekVideoElement(media.video, timeSec);
     drawCurrentVideoFrame(media, true);
-    if (media.playAfterSeek && media.video.readyState >= 2) {
+    const hasQueuedSeek =
+      typeof media.queuedVideoTime === "number" &&
+      Math.abs(media.queuedVideoTime - timeSec) > VIDEO_TIME_EPSILON_SEC;
+    if (media.playAfterSeek && !hasQueuedSeek && media.video.readyState >= 2) {
       if (setVideoPlaybackRate(media.video, media.requestedPlaybackRate ?? 1)) {
         playVideo(media);
       } else {
         media.playAfterSeek = false;
       }
     }
+  } catch {
+    media.playAfterSeek = false;
   } finally {
     media.videoSeekPending = false;
     const queuedTime = media.queuedVideoTime;
@@ -548,7 +560,8 @@ async function seekAndDrawVideoFrame(
 
     if (
       typeof queuedTime === "number" &&
-      Math.abs(queuedTime - (media.lastDrawnVideoTime ?? -1)) > 0.005
+      Math.abs(queuedTime - (media.lastDrawnVideoTime ?? -1)) >
+        VIDEO_TIME_EPSILON_SEC
     ) {
       requestVideoFrame(media, queuedTime, {
         playAfterSeek: media.playAfterSeek,
@@ -644,12 +657,19 @@ function seekVideoElement(video: HTMLVideoElement, timeSec: number): Promise<voi
   const duration = Number.isFinite(video.duration) ? video.duration : timeSec;
   const targetTime = Math.min(Math.max(0, timeSec), Math.max(0, duration));
 
-  if (Math.abs(video.currentTime - targetTime) < 0.005 && video.readyState >= 2) {
+  if (
+    Math.abs(video.currentTime - targetTime) < VIDEO_TIME_EPSILON_SEC &&
+    video.readyState >= 2
+  ) {
     return Promise.resolve();
   }
 
   return new Promise((resolve, reject) => {
+    let timeoutId: number | undefined;
     const cleanup = (): void => {
+      if (timeoutId !== undefined) {
+        window.clearTimeout(timeoutId);
+      }
       video.removeEventListener("seeked", onSeeked);
       video.removeEventListener("error", onError);
     };
@@ -665,6 +685,10 @@ function seekVideoElement(video: HTMLVideoElement, timeSec: number): Promise<voi
     video.addEventListener("seeked", onSeeked, { once: true });
     video.addEventListener("error", onError, { once: true });
     video.currentTime = targetTime;
+    timeoutId = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("Video seek timed out."));
+    }, VIDEO_SEEK_TIMEOUT_MS);
   });
 }
 
