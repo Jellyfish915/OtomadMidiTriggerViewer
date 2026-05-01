@@ -161,6 +161,13 @@ export type TransformState = {
   blurStrength: number;
 };
 
+export type VideoFrameCache = {
+  fps: number;
+  startFrame: number;
+  endFrame: number;
+  frames: CanvasImageSource[];
+};
+
 export type MediaAsset = {
   kind: Exclude<MediaKind, "none">;
   name: string;
@@ -171,12 +178,8 @@ export type MediaAsset = {
   video?: HTMLVideoElement;
   videoCanvas?: HTMLCanvasElement;
   videoContext?: CanvasRenderingContext2D;
-  videoSeekPending?: boolean;
-  queuedVideoTime?: number;
-  requestedVideoTime?: number;
-  lastDrawnVideoTime?: number;
-  playAfterSeek?: boolean;
-  requestedPlaybackRate?: number;
+  videoFrameCache?: VideoFrameCache;
+  displayedVideoFrame?: number;
 };
 
 export type RuntimeTriggerState = {

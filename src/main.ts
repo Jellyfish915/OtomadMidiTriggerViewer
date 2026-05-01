@@ -15,6 +15,13 @@ import {
   normalizeSettings,
   saveSettings
 } from "./settings";
+import {
+  buildVideoFrameCache,
+  drawCachedVideoFrame,
+  getVideoFrameCacheSize,
+  isVideoFrameCacheReady,
+  releaseVideoFrameCache
+} from "./videoFrames";
 import type {
   AnimationEffect,
   AppSettings,
@@ -83,6 +90,7 @@ type AppState = {
   pausedElapsedSec: number;
   forceRenderReset: boolean;
   rafId: number | null;
+  videoCacheBuildToken: number;
 };
 
 const appRoot = document.querySelector<HTMLDivElement>("#app");
@@ -113,7 +121,8 @@ async function bootstrap(root: HTMLElement): Promise<void> {
     playbackStartedAt: performance.now(),
     pausedElapsedSec: 0,
     forceRenderReset: true,
-    rafId: null
+    rafId: null,
+    videoCacheBuildToken: 0
   };
 
   try {
@@ -553,6 +562,7 @@ function bindControls(state: AppState): void {
     refs.fpsInput.value = String(state.settings.media.fps);
     state.forceRenderReset = true;
     persist(state);
+    void rebuildVideoFrameCache(state);
   });
   bindNumericInput(refs.startFrameInput, () => {
     state.settings.media.startFrame = Math.max(
@@ -566,6 +576,7 @@ function bindControls(state: AppState): void {
     }
     state.forceRenderReset = true;
     persist(state);
+    void rebuildVideoFrameCache(state);
   });
   bindNumericInput(refs.endFrameInput, () => {
     state.settings.media.endFrame = Math.max(
@@ -575,6 +586,7 @@ function bindControls(state: AppState): void {
     refs.endFrameInput.value = String(state.settings.media.endFrame);
     state.forceRenderReset = true;
     persist(state);
+    void rebuildVideoFrameCache(state);
   });
 
   bindCommittedInput(refs.backgroundInput, () => {
@@ -691,22 +703,42 @@ async function loadMediaFile(state: AppState): Promise<void> {
   }
 
   disposeMedia(state);
+  const loadToken = ++state.videoCacheBuildToken;
+  state.refs.playButton.disabled = true;
+  state.refs.exportButton.disabled = true;
+  state.refs.mediaName.textContent = `${file.name} loading...`;
 
   try {
     const asset = file.type.startsWith("video/")
-      ? await loadVideoAsset(file, state.settings)
+      ? await loadVideoAsset(file, state.settings, (done, total) => {
+          if (state.videoCacheBuildToken === loadToken) {
+            state.refs.mediaName.textContent = `${file.name} preparing frames ${done}/${total}`;
+          }
+        })
       : await loadImageAsset(file);
+    if (state.videoCacheBuildToken !== loadToken) {
+      disposeMediaAsset(asset);
+      return;
+    }
     state.media = asset;
     state.settings.media.kind = asset.kind;
     state.renderer.setMedia(asset);
-    state.refs.mediaName.textContent = `${file.name} (${asset.width}x${asset.height})`;
+    state.refs.mediaName.textContent = formatMediaAssetName(asset);
     state.refs.previewEmpty.hidden = true;
     syncMediaControls(state);
     state.forceRenderReset = true;
     persist(state);
   } catch (error) {
+    if (state.videoCacheBuildToken !== loadToken) {
+      return;
+    }
     state.refs.mediaName.textContent =
       error instanceof Error ? `読込失敗: ${error.message}` : "読込失敗";
+  } finally {
+    if (state.videoCacheBuildToken === loadToken) {
+      state.refs.playButton.disabled = false;
+      state.refs.exportButton.disabled = false;
+    }
   }
 }
 
@@ -727,7 +759,11 @@ async function loadImageAsset(file: File): Promise<MediaAsset> {
   };
 }
 
-async function loadVideoAsset(file: File, settings: AppSettings): Promise<MediaAsset> {
+async function loadVideoAsset(
+  file: File,
+  settings: AppSettings,
+  onProgress?: (done: number, total: number) => void
+): Promise<MediaAsset> {
   const url = URL.createObjectURL(file);
   const video = document.createElement("video");
   video.src = url;
@@ -739,8 +775,9 @@ async function loadVideoAsset(file: File, settings: AppSettings): Promise<MediaA
   if (video.readyState < 2) {
     await waitForEvent(video, "loadeddata");
   }
-  const width = video.videoWidth || 1920;
-  const height = video.videoHeight || 1080;
+  const sourceWidth = video.videoWidth || 1920;
+  const sourceHeight = video.videoHeight || 1080;
+  const { width, height } = getVideoFrameCacheSize(sourceWidth, sourceHeight);
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -749,12 +786,8 @@ async function loadVideoAsset(file: File, settings: AppSettings): Promise<MediaA
     throw new Error("動画フレーム用canvasを作成できませんでした。");
   }
 
-  const startTime = Math.max(0, settings.media.startFrame / settings.media.fps);
-  await seekVideo(video, startTime);
-  video.pause();
-  context.drawImage(video, 0, 0, width, height);
-
-  return {
+  const cache = await buildVideoFrameCache(video, settings, width, height, onProgress);
+  const asset: MediaAsset = {
     kind: "video",
     name: file.name,
     url,
@@ -764,9 +797,10 @@ async function loadVideoAsset(file: File, settings: AppSettings): Promise<MediaA
     video,
     videoCanvas: canvas,
     videoContext: context,
-    requestedVideoTime: startTime,
-    lastDrawnVideoTime: startTime
+    videoFrameCache: cache
   };
+  drawCachedVideoFrame(asset, cache.startFrame);
+  return asset;
 }
 
 function disposeMedia(state: AppState): void {
@@ -774,11 +808,81 @@ function disposeMedia(state: AppState): void {
     return;
   }
 
+  state.videoCacheBuildToken += 1;
   state.renderer.setMedia(null);
-  state.media.video?.pause();
-  state.media.texture.destroy(true);
-  URL.revokeObjectURL(state.media.url);
+  disposeMediaAsset(state.media);
   state.media = null;
+}
+
+function disposeMediaAsset(media: MediaAsset): void {
+  media.video?.pause();
+  releaseVideoFrameCache(media.videoFrameCache);
+  media.texture.destroy(true);
+  URL.revokeObjectURL(media.url);
+}
+
+async function rebuildVideoFrameCache(state: AppState): Promise<void> {
+  const media = state.media;
+  if (
+    !media ||
+    media.kind !== "video" ||
+    !media.video ||
+    !media.videoCanvas ||
+    !media.videoContext ||
+    isVideoFrameCacheReady(media, state.settings)
+  ) {
+    return;
+  }
+
+  const buildToken = ++state.videoCacheBuildToken;
+  state.isPlaying = false;
+  state.refs.playButton.disabled = true;
+  state.refs.exportButton.disabled = true;
+  state.refs.mediaName.textContent = `${media.name} preparing frames...`;
+  syncTransport(state);
+
+  try {
+    const cache = await buildVideoFrameCache(
+      media.video,
+      state.settings,
+      media.width,
+      media.height,
+      (done, total) => {
+        if (state.videoCacheBuildToken === buildToken && state.media === media) {
+          state.refs.mediaName.textContent = `${media.name} preparing frames ${done}/${total}`;
+        }
+      }
+    );
+
+    if (state.videoCacheBuildToken !== buildToken || state.media !== media) {
+      releaseVideoFrameCache(cache);
+      return;
+    }
+
+    releaseVideoFrameCache(media.videoFrameCache);
+    media.videoFrameCache = cache;
+    media.displayedVideoFrame = undefined;
+    drawCachedVideoFrame(media, cache.startFrame);
+    state.forceRenderReset = true;
+    state.refs.mediaName.textContent = formatMediaAssetName(media);
+  } catch (error) {
+    if (state.videoCacheBuildToken === buildToken && state.media === media) {
+      state.refs.mediaName.textContent =
+        error instanceof Error ? `Frame cache failed: ${error.message}` : "Frame cache failed";
+    }
+  } finally {
+    if (state.videoCacheBuildToken === buildToken && state.media === media) {
+      state.refs.playButton.disabled = false;
+      state.refs.exportButton.disabled = false;
+      syncTransport(state);
+    }
+  }
+}
+
+function formatMediaAssetName(media: MediaAsset): string {
+  const frameCount = media.videoFrameCache?.frames.length;
+  const frameSuffix = frameCount ? `, ${frameCount} frames cached` : "";
+  return `${media.name} (${media.width}x${media.height}${frameSuffix})`;
 }
 
 async function exportVideo(state: AppState): Promise<void> {
@@ -789,6 +893,14 @@ async function exportVideo(state: AppState): Promise<void> {
   if (!state.media) {
     state.refs.exportStatus.textContent = "素材を読み込んでください";
     return;
+  }
+
+  if (state.media.kind === "video" && !isVideoFrameCacheReady(state.media, state.settings)) {
+    await rebuildVideoFrameCache(state);
+    if (!state.media || !isVideoFrameCacheReady(state.media, state.settings)) {
+      state.refs.exportStatus.textContent = "Video frames are not ready.";
+      return;
+    }
   }
 
   const sourceCanvas = state.renderer.getCanvas();

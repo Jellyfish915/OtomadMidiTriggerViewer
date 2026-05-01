@@ -20,6 +20,11 @@ import type {
   MidiTrigger,
   TransformState
 } from "./types";
+import {
+  drawCachedVideoFrame,
+  getVideoFrameCacheSpec,
+  isVideoFrameCacheReady
+} from "./videoFrames";
 
 export type MaskRect = {
   x: number;
@@ -53,10 +58,6 @@ type RuntimeInstance = {
 const MASK_MARGIN = 32;
 const TILE_RADIUS = 4;
 const BLUR_EPSILON = 0.05;
-const MAX_REALTIME_PLAYBACK_RATE = 4;
-const MIN_REALTIME_PLAYBACK_RATE = 0.25;
-const VIDEO_TIME_EPSILON_SEC = 0.005;
-const VIDEO_SEEK_TIMEOUT_MS = 1500;
 
 export class PixiPreviewRenderer {
   private app: Application | null = null;
@@ -314,7 +315,7 @@ export class PixiPreviewRenderer {
     }
 
     const ageSec = Math.max(0, timeSec - this.current.triggerTimeSec);
-    this.updateVideoFrame(settings, ageSec, isPlaying);
+    this.updateVideoFrame(settings, ageSec);
     const enterTransform = getTransformForPhase(settings, "enter", ageSec);
     const nextTrigger = getNextTrigger(triggers, this.current.triggerIndex);
     const transform = nextTrigger
@@ -326,83 +327,26 @@ export class PixiPreviewRenderer {
     this.applyInstanceState(this.current, transform, settings);
   }
 
-  private updateVideoFrame(
-    settings: AppSettings,
-    ageSec: number,
-    isPlaying: boolean
-  ): void {
+  private updateVideoFrame(settings: AppSettings, ageSec: number): void {
     const media = this.media;
     if (
       !media ||
       media.kind !== "video" ||
-      !media.video ||
       !media.videoCanvas ||
-      !media.videoContext
+      !media.videoContext ||
+      !isVideoFrameCacheReady(media, settings)
     ) {
       return;
     }
 
-    const video = media.video;
-    const fps = Math.max(1, settings.media.fps);
-    const start = Math.max(0, settings.media.startFrame);
-    const end = Math.max(start, settings.media.endFrame);
+    const { fps, startFrame: start, endFrame: end } =
+      getVideoFrameCacheSpec(settings);
     const span = end - start;
     const durationSec = span / fps;
     const progress = durationSec <= 0 ? 1 : Math.min(1, ageSec / durationSec);
     const eased = evaluateBezier(settings.media.timeCurve, progress);
     const frame = start + span * eased;
-    const desiredTime = frame / fps;
-    const atEnd = progress >= 1 || durationSec <= 0;
-    const playbackRate = estimatePlaybackRate(settings, progress);
-    const canPlayRealtime =
-      isPlaying &&
-      !atEnd &&
-      playbackRate >= MIN_REALTIME_PLAYBACK_RATE &&
-      Number.isFinite(playbackRate);
-    const clampedPlaybackRate = Math.min(
-      MAX_REALTIME_PLAYBACK_RATE,
-      Math.max(MIN_REALTIME_PLAYBACK_RATE, playbackRate)
-    );
-    const seekToleranceSec = Math.max(1 / fps, 0.04);
-    const driftSec = Math.abs(video.currentTime - desiredTime);
-
-    if (media.videoSeekPending) {
-      const activeSeekTime =
-        media.requestedVideoTime ?? media.lastDrawnVideoTime ?? video.currentTime;
-      if (Math.abs(desiredTime - activeSeekTime) > VIDEO_TIME_EPSILON_SEC) {
-        media.queuedVideoTime = desiredTime;
-      }
-      media.playAfterSeek = canPlayRealtime;
-      media.requestedPlaybackRate = clampedPlaybackRate;
-      drawCurrentVideoFrame(media);
-      return;
-    }
-
-    if (!canPlayRealtime || driftSec > seekToleranceSec) {
-      pauseVideo(media);
-      if (
-        driftSec > VIDEO_TIME_EPSILON_SEC &&
-        Math.abs((media.requestedVideoTime ?? -1) - desiredTime) >
-          VIDEO_TIME_EPSILON_SEC
-      ) {
-        requestVideoFrame(media, desiredTime, {
-          playAfterSeek: canPlayRealtime,
-          playbackRate: clampedPlaybackRate
-        });
-      }
-      drawCurrentVideoFrame(media);
-      return;
-    }
-
-    if (!setVideoPlaybackRate(video, clampedPlaybackRate)) {
-      pauseVideo(media);
-      requestVideoFrame(media, desiredTime);
-      drawCurrentVideoFrame(media);
-      return;
-    }
-
-    playVideo(media);
-    drawCurrentVideoFrame(media);
+    drawCachedVideoFrame(media, frame);
   }
 
   private applyInstanceState(
@@ -512,184 +456,14 @@ function hexColorToNumber(color: string): number {
   return Number.parseInt(normalized, 16);
 }
 
-function requestVideoFrame(
-  media: MediaAsset,
-  timeSec: number,
-  options: { playAfterSeek?: boolean; playbackRate?: number } = {}
-): void {
-  media.requestedVideoTime = timeSec;
-  media.playAfterSeek = Boolean(options.playAfterSeek);
-  media.requestedPlaybackRate = options.playbackRate ?? 1;
-
-  if (media.videoSeekPending) {
-    media.queuedVideoTime = timeSec;
-    return;
-  }
-
-  void seekAndDrawVideoFrame(media, timeSec);
-}
-
-async function seekAndDrawVideoFrame(
-  media: MediaAsset,
-  timeSec: number
-): Promise<void> {
-  if (!media.video || !media.videoContext || !media.videoCanvas) {
-    return;
-  }
-
-  media.videoSeekPending = true;
-  try {
-    await seekVideoElement(media.video, timeSec);
-    drawCurrentVideoFrame(media, true);
-    const hasQueuedSeek =
-      typeof media.queuedVideoTime === "number" &&
-      Math.abs(media.queuedVideoTime - timeSec) > VIDEO_TIME_EPSILON_SEC;
-    if (media.playAfterSeek && !hasQueuedSeek && media.video.readyState >= 2) {
-      if (setVideoPlaybackRate(media.video, media.requestedPlaybackRate ?? 1)) {
-        playVideo(media);
-      } else {
-        media.playAfterSeek = false;
-      }
-    }
-  } catch {
-    media.playAfterSeek = false;
-  } finally {
-    media.videoSeekPending = false;
-    const queuedTime = media.queuedVideoTime;
-    media.queuedVideoTime = undefined;
-
-    if (
-      typeof queuedTime === "number" &&
-      Math.abs(queuedTime - (media.lastDrawnVideoTime ?? -1)) >
-        VIDEO_TIME_EPSILON_SEC
-    ) {
-      requestVideoFrame(media, queuedTime, {
-        playAfterSeek: media.playAfterSeek,
-        playbackRate: media.requestedPlaybackRate
-      });
-    }
-  }
-}
-
-function drawCurrentVideoFrame(media: MediaAsset, force = false): void {
-  if (!media.video || !media.videoContext || !media.videoCanvas) {
-    return;
-  }
-
-  if (media.videoSeekPending && !force) {
-    return;
-  }
-
-  if (media.video.readyState < 2) {
-    return;
-  }
-
-  if (
-    !force &&
-    typeof media.lastDrawnVideoTime === "number" &&
-    Math.abs(media.video.currentTime - media.lastDrawnVideoTime) < 0.001
-  ) {
-    return;
-  }
-
-  media.videoContext.drawImage(
-    media.video,
-    0,
-    0,
-    media.videoCanvas.width,
-    media.videoCanvas.height
-  );
-  media.texture.source.update();
-  media.lastDrawnVideoTime = media.video.currentTime;
-}
-
-function playVideo(media: MediaAsset): void {
-  const video = media.video;
-  if (!video || (!video.paused && !video.ended)) {
-    return;
-  }
-
-  void video.play().catch(() => {
-    // Muted object-URL videos usually play without a gesture. If the browser
-    // still blocks playback, the next render tick will keep the last frame.
-  });
-}
-
-function setVideoPlaybackRate(video: HTMLVideoElement, playbackRate: number): boolean {
-  try {
-    video.playbackRate = Math.min(
-      MAX_REALTIME_PLAYBACK_RATE,
-      Math.max(MIN_REALTIME_PLAYBACK_RATE, playbackRate)
-    );
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function pauseVideo(media: MediaAsset | null): void {
   if (!media?.video) {
     return;
   }
 
-  media.playAfterSeek = false;
   if (!media.video.paused) {
     media.video.pause();
   }
-}
-
-function estimatePlaybackRate(settings: AppSettings, progress: number): number {
-  const step = 0.005;
-  const lower = Math.max(0, progress - step);
-  const upper = Math.min(1, progress + step);
-
-  if (upper <= lower) {
-    return 1;
-  }
-
-  const easedLower = evaluateBezier(settings.media.timeCurve, lower);
-  const easedUpper = evaluateBezier(settings.media.timeCurve, upper);
-
-  return (easedUpper - easedLower) / (upper - lower);
-}
-
-function seekVideoElement(video: HTMLVideoElement, timeSec: number): Promise<void> {
-  const duration = Number.isFinite(video.duration) ? video.duration : timeSec;
-  const targetTime = Math.min(Math.max(0, timeSec), Math.max(0, duration));
-
-  if (
-    Math.abs(video.currentTime - targetTime) < VIDEO_TIME_EPSILON_SEC &&
-    video.readyState >= 2
-  ) {
-    return Promise.resolve();
-  }
-
-  return new Promise((resolve, reject) => {
-    let timeoutId: number | undefined;
-    const cleanup = (): void => {
-      if (timeoutId !== undefined) {
-        window.clearTimeout(timeoutId);
-      }
-      video.removeEventListener("seeked", onSeeked);
-      video.removeEventListener("error", onError);
-    };
-    const onSeeked = (): void => {
-      cleanup();
-      resolve();
-    };
-    const onError = (): void => {
-      cleanup();
-      reject(new Error("Video seek failed."));
-    };
-
-    video.addEventListener("seeked", onSeeked, { once: true });
-    video.addEventListener("error", onError, { once: true });
-    video.currentTime = targetTime;
-    timeoutId = window.setTimeout(() => {
-      cleanup();
-      reject(new Error("Video seek timed out."));
-    }, VIDEO_SEEK_TIMEOUT_MS);
-  });
 }
 
 function wrapCentered(value: number, size: number): number {
